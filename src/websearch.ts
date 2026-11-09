@@ -77,13 +77,7 @@ const DEFAULT_MAX_CHARS = 30000;
 
 type FetchRoute = { endpoint: "/fetch-web" | "/fetch-github-readme"; url: string };
 
-/**
- * Pick the daemon endpoint for a URL. Only a bare github.com/owner/repo goes to
- * the README fetcher; blob links are rewritten to raw.githubusercontent.com and
- * everything else (issues, PRs, gists, docs.github.com) is fetched as a page.
- * Match on hostname only — never substring-match the full URL, which would
- * route e.g. https://evil.example/?q=github.com to the GitHub README fetcher.
- */
+/** Bare github.com/owner/repo -> README; blob -> raw file; anything else -> page. */
 export function resolveFetchRoute(parsed: URL): FetchRoute {
   const target = parsed.toString();
   if (parsed.hostname.toLowerCase() !== "github.com") {
@@ -103,7 +97,6 @@ export function resolveFetchRoute(parsed: URL): FetchRoute {
   return { endpoint: "/fetch-web", url: target };
 }
 
-/** Truncate like the daemon does, for endpoints that ignore maxChars. */
 function truncateContent(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   return `${text.slice(0, maxChars)}\n\n[...truncated ${text.length - maxChars} characters]`;
@@ -484,8 +477,7 @@ export default function websearchExtension(pi: ExtensionAPI) {
         try {
           data = await callDaemon(endpoint);
         } catch (err) {
-          // github.com/<owner>/<x> is not always a repo (e.g. /features/copilot);
-          // fall back to fetching it as a regular page.
+          // Not every github.com/a/b is a repo (e.g. /features/copilot).
           if (endpoint !== "/fetch-github-readme" || signal?.aborted) throw err;
           endpoint = "/fetch-web";
           data = await callDaemon(endpoint);
