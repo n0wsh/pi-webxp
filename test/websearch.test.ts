@@ -278,6 +278,49 @@ describe("pi-webxp: web_search/web_fetch", () => {
     assert.strictEqual(result.details.results[0].title, "Retry OK");
   });
 
+  it("surfaces daemon error messages without the startup hint", async () => {
+    const pi = new MockExtensionAPI();
+    piWebxp(pi as any);
+    const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
+
+    let calls = 0;
+    let status = 502;
+    let error: Record<string, unknown> = { message: "Target returned HTTP 404", retryable: true };
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      if (url.toString().endsWith("/health")) {
+        return { ok: true, json: async () => ({ status: "ok", data: {} }) } as Response;
+      }
+      calls++;
+      return {
+        ok: false,
+        status,
+        json: async () => ({ status: "error", data: null, error, hint: "Try again" }),
+      } as unknown as Response;
+    }) as any;
+
+    await assert.rejects(
+      () => fetchTool.execute("c1", { url: "https://example.com/missing" }, null, null, null),
+      (err: Error) => err.message === "Web fetch failed: Target returned HTTP 404\nHint: Try again",
+    );
+    assert.strictEqual(calls, 2);
+
+    calls = 0;
+    status = 503;
+    error = { message: "Playwright is not available", retryable: false };
+    await assert.rejects(
+      () =>
+        fetchTool.execute(
+          "c2",
+          { url: "https://example.com", renderMode: "browser" },
+          null,
+          null,
+          null,
+        ),
+      /Playwright is not available/,
+    );
+    assert.strictEqual(calls, 1);
+  });
+
   it("web_fetch blocks private/internal hosts (SSRF guard)", async () => {
     const pi = new MockExtensionAPI();
     piWebxp(pi as any);
