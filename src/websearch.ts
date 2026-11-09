@@ -57,9 +57,45 @@ type FetchData =
       markdown?: string;
       content?: string;
       text?: string;
-      renderedBy?: string;
+      retrievalMethod?: string;
       [key: string]: unknown;
     };
+
+const DEFAULT_MAX_CHARS = 30000;
+
+type FetchRoute = { endpoint: "/fetch-web" | "/fetch-github-readme"; url: string };
+
+/**
+ * Pick the daemon endpoint for a URL. Only a bare github.com/owner/repo goes to
+ * the README fetcher; blob links are rewritten to raw.githubusercontent.com and
+ * everything else (issues, PRs, gists, docs.github.com) is fetched as a page.
+ * Match on hostname only — never substring-match the full URL, which would
+ * route e.g. https://evil.example/?q=github.com to the GitHub README fetcher.
+ */
+export function resolveFetchRoute(parsed: URL): FetchRoute {
+  const target = parsed.toString();
+  if (parsed.hostname.toLowerCase() !== "github.com") {
+    return { endpoint: "/fetch-web", url: target };
+  }
+  const segments = parsed.pathname.split("/").filter((seg) => seg.length > 0);
+  if (segments.length === 2 && !parsed.search) {
+    return { endpoint: "/fetch-github-readme", url: target };
+  }
+  if (segments.length >= 5 && segments[2] === "blob") {
+    const [owner, repo, , ...rest] = segments;
+    return {
+      endpoint: "/fetch-web",
+      url: `https://raw.githubusercontent.com/${owner}/${repo}/${rest.join("/")}`,
+    };
+  }
+  return { endpoint: "/fetch-web", url: target };
+}
+
+/** Truncate like the daemon does, for endpoints that ignore maxChars. */
+function truncateContent(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n\n[...truncated ${text.length - maxChars} characters]`;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -252,7 +288,7 @@ function handleWebsearchError(err: unknown, toolName: string): never {
     message.includes("HTTP 504") ||
     message.includes("daemon")
   ) {
-    hint = `\n\nHint: The 'open-websearch' daemon on port ${DAEMON_PORT} could not be reached or failed to start.\nTo troubleshoot:\n  1. Run 'npm install' in the project root to link all dependencies.\n  2. Verify if another server is already bound to port ${DAEMON_PORT}.\n  3. You can manually launch the daemon by running:\n     npx open-websearch serve --port ${DAEMON_PORT}`;
+    hint = `\n\nHint: The 'open-websearch' daemon on port ${DAEMON_PORT} could not be reached or failed to start.\nTo troubleshoot:\n  1. Reinstall the package with 'pi install npm:@xaccefy/pi-webxp' so open-websearch is present.\n  2. Verify if another server is already bound to port ${DAEMON_PORT}.\n  3. You can manually launch the daemon by running:\n     npx open-websearch serve --port ${DAEMON_PORT}`;
   }
   throw new Error(`${toolName} failed: ${message}${hint}`, { cause: err });
 }
@@ -367,11 +403,25 @@ export default function websearchExtension(pi: ExtensionAPI) {
   pi.registerTool({
     name: "web_fetch",
     label: "Web Fetch",
-    description: "Read text, markdown, or GitHub README content from an HTTP/HTTPS URL.",
+    description:
+      "Read text or markdown from an HTTP/HTTPS URL. A bare github.com/owner/repo URL returns its README; GitHub blob URLs return the raw file.",
     promptSnippet: "Fetch the text/markdown content of a URL",
     parameters: Type.Object(
       {
         url: Type.String({ description: "Valid HTTP or HTTPS URL to fetch" }),
+        maxChars: Type.Optional(
+          Type.Integer({
+            description: `Max characters of content to return (1000-200000, default: ${DEFAULT_MAX_CHARS})`,
+            minimum: 1000,
+            maximum: 200000,
+          }),
+        ),
+        renderMode: Type.Optional(
+          Type.Union([Type.Literal("request"), Type.Literal("auto"), Type.Literal("browser")], {
+            description:
+              "request: plain HTTP only; auto (default): fall back to a browser for JS-heavy pages; browser: always render",
+          }),
+        ),
       },
       { additionalProperties: false },
     ),
@@ -396,40 +446,59 @@ export default function websearchExtension(pi: ExtensionAPI) {
         }
         // This preflight check does not pin the daemon's later DNS resolution.
         await assertPublicDns(parsedUrl.hostname);
-        const targetUrl = parsedUrl.toString();
+        const maxChars = params.maxChars ?? DEFAULT_MAX_CHARS;
+        const route = resolveFetchRoute(parsedUrl);
+        const targetUrl = route.url;
 
-        // Match on hostname only — never substring-match the full URL, which would
-        // route e.g. https://evil.example/?q=github.com to the GitHub README fetcher.
-        const host = parsedUrl.hostname.toLowerCase();
-        const endpoint =
-          host === "github.com" || host.endsWith(".github.com")
-            ? "/fetch-github-readme"
-            : "/fetch-web";
+        const callDaemon = async (endpoint: FetchRoute["endpoint"]): Promise<FetchData> => {
+          const res = await fetchWithRetry(
+            `${DAEMON_URL}${endpoint}`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify(
+                endpoint === "/fetch-web"
+                  ? { url: targetUrl, maxChars, renderMode: params.renderMode }
+                  : { url: targetUrl },
+              ),
+            },
+            signal,
+          );
+          const body = (await res.json()) as DaemonResponse<FetchData>;
+          if (body?.status !== "ok" || !body?.data) {
+            throw new Error(body?.error?.message || "Invalid response from daemon");
+          }
+          return body.data;
+        };
 
-        const res = await fetchWithRetry(
-          `${DAEMON_URL}${endpoint}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ url: targetUrl }),
-          },
-          signal,
-        );
-
-        const body = (await res.json()) as DaemonResponse<FetchData>;
-        if (body?.status !== "ok" || !body?.data) {
-          throw new Error(body?.error?.message || "Invalid response from daemon");
+        let endpoint = route.endpoint;
+        let data: FetchData;
+        try {
+          data = await callDaemon(endpoint);
+        } catch (err) {
+          // github.com/<owner>/<x> is not always a repo (e.g. /features/copilot);
+          // fall back to fetching it as a regular page.
+          if (endpoint !== "/fetch-github-readme" || signal?.aborted) throw err;
+          endpoint = "/fetch-web";
+          data = await callDaemon(endpoint);
         }
 
-        const data = body.data;
-        const textContent =
+        const rawText =
           typeof data === "string"
             ? data
             : data.markdown || data.content || data.text || JSON.stringify(data);
+        // /fetch-web already truncates to maxChars; the README fetcher does not.
+        const textContent =
+          endpoint === "/fetch-github-readme" ? truncateContent(rawText, maxChars) : rawText;
+        const retrievalMethod = typeof data === "string" ? undefined : data.retrievalMethod;
 
         return {
           content: [{ type: "text" as const, text: textContent }],
-          details: { metadata: data, url: targetUrl },
+          details: {
+            metadata: data,
+            url: targetUrl,
+            renderedBy: retrievalMethod?.startsWith("browser") ? retrievalMethod : undefined,
+          },
         };
       } catch (err) {
         return handleWebsearchError(err, "Web fetch");

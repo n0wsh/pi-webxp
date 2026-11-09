@@ -99,21 +99,21 @@ describe("pi-webxp: web_search/web_fetch", () => {
     assert.strictEqual(fetchResult.content[0].text, "# Mocked Markdown Content");
   });
 
-  it("routes github.com hosts to /fetch-github-readme, everything else to /fetch-web", async () => {
+  it("routes only bare github.com/owner/repo to /fetch-github-readme", async () => {
     const pi = new MockExtensionAPI();
     piWebxp(pi as any);
     const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
     assert.ok(fetchTool);
 
-    const hitEndpoints: string[] = [];
-    globalThis.fetch = (async (url: string | URL | Request) => {
+    const hits: Array<[string, string]> = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
       const urlStr = url.toString();
       const path = urlStr.slice(urlStr.indexOf("/", "http://x".length)); // everything after host
       if (urlStr.endsWith("/health")) {
         return { ok: true, json: async () => ({ status: "ok", data: {} }) } as Response;
       }
       if (urlStr.endsWith("/fetch-github-readme") || urlStr.endsWith("/fetch-web")) {
-        hitEndpoints.push(path);
+        hits.push([path, JSON.parse(init?.body as string).url]);
         return {
           ok: true,
           json: async () => ({ status: "ok", data: { url: "", markdown: "x" } }),
@@ -122,18 +122,120 @@ describe("pi-webxp: web_search/web_fetch", () => {
       throw new Error(`unexpected endpoint: ${urlStr}`);
     }) as any;
 
-    await fetchTool.execute("c1", { url: "https://github.com/owner/repo" }, null, null, null);
-    await fetchTool.execute("c2", { url: "https://gist.github.com/user/id" }, null, null, null);
-    await fetchTool.execute("c3", { url: "https://example.com/page" }, null, null, null);
-    // Substring in the query string must NOT trigger the GitHub route.
-    await fetchTool.execute("c4", { url: "https://evil.example/?q=github.com" }, null, null, null);
+    const urls = [
+      "https://github.com/owner/repo",
+      "https://github.com/owner/repo/issues/12",
+      "https://github.com/owner/repo/blob/main/src/a.ts",
+      "https://gist.github.com/user/id",
+      "https://docs.github.com/en/actions",
+      "https://example.com/page",
+      // Substring in the query string must NOT trigger the GitHub route.
+      "https://evil.example/?q=github.com",
+    ];
+    for (const [i, url] of urls.entries()) {
+      await fetchTool.execute(`c${i}`, { url }, null, null, null);
+    }
 
-    assert.deepStrictEqual(hitEndpoints, [
-      "/fetch-github-readme",
-      "/fetch-github-readme",
-      "/fetch-web",
-      "/fetch-web",
+    assert.deepStrictEqual(hits, [
+      ["/fetch-github-readme", "https://github.com/owner/repo"],
+      ["/fetch-web", "https://github.com/owner/repo/issues/12"],
+      ["/fetch-web", "https://raw.githubusercontent.com/owner/repo/main/src/a.ts"],
+      ["/fetch-web", "https://gist.github.com/user/id"],
+      ["/fetch-web", "https://docs.github.com/en/actions"],
+      ["/fetch-web", "https://example.com/page"],
+      ["/fetch-web", "https://evil.example/?q=github.com"],
     ]);
+  });
+
+  it("falls back to /fetch-web when the README fetcher 404s", async () => {
+    const pi = new MockExtensionAPI();
+    piWebxp(pi as any);
+    const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
+
+    const hits: string[] = [];
+    globalThis.fetch = (async (url: string | URL | Request) => {
+      const urlStr = url.toString();
+      if (urlStr.endsWith("/health")) {
+        return { ok: true, json: async () => ({ status: "ok", data: {} }) } as Response;
+      }
+      if (urlStr.endsWith("/fetch-github-readme")) {
+        hits.push("readme");
+        return { ok: false, status: 404, body: null } as unknown as Response;
+      }
+      if (urlStr.endsWith("/fetch-web")) {
+        hits.push("web");
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", data: { content: "Copilot page" } }),
+        } as Response;
+      }
+      throw new Error(`unexpected endpoint: ${urlStr}`);
+    }) as any;
+
+    const result = await fetchTool.execute(
+      "c1",
+      { url: "https://github.com/features/copilot" },
+      null,
+      null,
+      null,
+    );
+    assert.deepStrictEqual(hits, ["readme", "web"]);
+    assert.strictEqual(result.content[0].text, "Copilot page");
+  });
+
+  it("passes maxChars/renderMode to /fetch-web and truncates README output", async () => {
+    const pi = new MockExtensionAPI();
+    piWebxp(pi as any);
+    const fetchTool = pi.tools.find((t) => t.name === "web_fetch");
+
+    const bodies: any[] = [];
+    globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = url.toString();
+      if (urlStr.endsWith("/health")) {
+        return { ok: true, json: async () => ({ status: "ok", data: {} }) } as Response;
+      }
+      bodies.push(JSON.parse(init?.body as string));
+      if (urlStr.endsWith("/fetch-github-readme")) {
+        return {
+          ok: true,
+          json: async () => ({ status: "ok", data: { content: "r".repeat(1500) } }),
+        } as Response;
+      }
+      return {
+        ok: true,
+        json: async () => ({
+          status: "ok",
+          data: { content: "page", retrievalMethod: "browser-html" },
+        }),
+      } as Response;
+    }) as any;
+
+    const page = await fetchTool.execute(
+      "c1",
+      { url: "https://example.com/spa", maxChars: 5000, renderMode: "browser" },
+      null,
+      null,
+      null,
+    );
+    assert.deepStrictEqual(bodies[0], {
+      url: "https://example.com/spa",
+      maxChars: 5000,
+      renderMode: "browser",
+    });
+    assert.strictEqual(page.details.renderedBy, "browser-html");
+
+    const readme = await fetchTool.execute(
+      "c2",
+      { url: "https://github.com/owner/repo", maxChars: 1000 },
+      null,
+      null,
+      null,
+    );
+    assert.deepStrictEqual(bodies[1], { url: "https://github.com/owner/repo" });
+    assert.strictEqual(
+      readme.content[0].text,
+      `${"r".repeat(1000)}\n\n[...truncated 500 characters]`,
+    );
   });
 
   it("retries fetchWithRetry once on a transient 500 then succeeds", async () => {
