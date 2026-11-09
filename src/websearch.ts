@@ -37,8 +37,20 @@ let startupPromise: Promise<boolean> | null = null;
 type DaemonResponse<T> = {
   status?: string;
   data?: T;
-  error?: { message?: string };
+  error?: { message?: string; retryable?: boolean };
+  hint?: string | null;
 };
+
+/** An error the daemon reported itself, so it is reachable and needs no startup hint. */
+class DaemonReportedError extends Error {}
+
+async function readDaemonError(res: Response): Promise<DaemonResponse<unknown>> {
+  try {
+    return (await res.json()) as DaemonResponse<unknown>;
+  } catch {
+    return {};
+  }
+}
 
 type SearchResult = {
   title?: string;
@@ -233,32 +245,27 @@ async function fetchWithRetry(
       ]),
     });
 
+  const failure = async (res: Response, suffix = "") => {
+    const { error, hint } = await readDaemonError(res);
+    const err = error?.message
+      ? new DaemonReportedError(hint ? `${error.message}\nHint: ${hint}` : error.message)
+      : new Error(`HTTP ${res.status}${suffix}`);
+    return { err, retryable: error?.retryable !== false };
+  };
+
   const first = await doFetch();
   if (first.ok) return first;
 
   const status = first.status;
-  try {
-    first.body?.cancel();
-  } catch {
-    // ignore
-  }
-
+  const { err, retryable } = await failure(first);
   // Only retry transient failures (408/429/5xx); permanent 4xx should fail fast.
-  if (!(status === 408 || status === 429 || status >= 500)) {
-    throw new Error(`HTTP ${status}`);
+  if (!(status === 408 || status === 429 || status >= 500) || !retryable || parentSignal?.aborted) {
+    throw err;
   }
-  if (parentSignal?.aborted) throw new Error(`HTTP ${status}`);
 
   await abortableSleep(150, parentSignal);
   const retry = await doFetch();
-  if (!retry.ok) {
-    try {
-      retry.body?.cancel();
-    } catch {
-      // ignore
-    }
-    throw new Error(`HTTP ${retry.status} after retry`);
-  }
+  if (!retry.ok) throw (await failure(retry, " after retry")).err;
   return retry;
 }
 
@@ -281,12 +288,13 @@ function handleWebsearchError(err: unknown, toolName: string): never {
   const message = err instanceof Error ? err.message : String(err);
   let hint = "";
   if (
-    message.includes("establish connection") ||
-    message.includes("fetch failed") ||
-    message.includes("ECONNREFUSED") ||
-    message.includes("HTTP 502") ||
-    message.includes("HTTP 504") ||
-    message.includes("daemon")
+    !(err instanceof DaemonReportedError) &&
+    (message.includes("establish connection") ||
+      message.includes("fetch failed") ||
+      message.includes("ECONNREFUSED") ||
+      message.includes("HTTP 502") ||
+      message.includes("HTTP 504") ||
+      message.includes("daemon"))
   ) {
     hint = `\n\nHint: The 'open-websearch' daemon on port ${DAEMON_PORT} could not be reached or failed to start.\nTo troubleshoot:\n  1. Reinstall the package with 'pi install npm:@xaccefy/pi-webxp' so open-websearch is present.\n  2. Verify if another server is already bound to port ${DAEMON_PORT}.\n  3. You can manually launch the daemon by running:\n     npx open-websearch serve --port ${DAEMON_PORT}`;
   }
